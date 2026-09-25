@@ -1,0 +1,8 @@
+# Pinned for Streamlit Community Cloud (Python 3.10+).
+# langgraph pulls langgraph-checkpoint + langgraph-prebuilt transitively.
+# langchain-core pulls langsmith, which is required for tracing.
+
+streamlit==1.64.0
+langgraph==1.2.12
+langchain-openai==1.6.6
+langchain-core==1.6.5
