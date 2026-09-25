@@ -16,6 +16,7 @@ from __future__ import annotations
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterator
 
 import streamlit as st
@@ -48,12 +49,34 @@ st.set_page_config(
 )
 
 LANGSMITH_PROJECT = "deploy-demo-session"
-MODEL_NAME = "gpt-4o-mini"
+GROQ_BASE_URL = "https://api.groq.com/openai/v1"
+# Fast, tool-calling model on Groq's developer/free plan.
+# Swap via GROQ_MODEL if your console lists a different id.
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 
 
 # ===========================================================================
-# 1. Secrets & LangSmith observability
+# 1. Secrets, local .env, and LangSmith observability
 # ===========================================================================
+def _load_dotenv(path: str = ".env") -> None:
+    """Load KEY=VALUE pairs from a local .env without overriding real env vars.
+
+    Streamlit Cloud never ships your .env; this is only for laptop runs.
+    """
+    env_file = Path(path)
+    if not env_file.is_file():
+        return
+    try:
+        for raw in env_file.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+    except OSError:
+        return
+
+
 def _read_secret(key: str) -> str | None:
     """Read a value from Streamlit secrets, then process env, then nothing.
 
@@ -77,18 +100,33 @@ def configure_environment() -> dict[str, Any]:
     clients read these variables at invoke-time, so we set them on every
     Streamlit rerun *before* the agent is called.
     """
-    openai_key = _read_secret("OPENAI_API_KEY")
-    langsmith_key = _read_secret("LANGCHAIN_API_KEY") or _read_secret("LANGSMITH_API_KEY")
-    project = _read_secret("LANGCHAIN_PROJECT") or _read_secret("LANGSMITH_PROJECT") or LANGSMITH_PROJECT
+    _load_dotenv()
 
-    if openai_key:
-        os.environ["OPENAI_API_KEY"] = openai_key
+    groq_key = _read_secret("GROQ_KEY") or _read_secret("GROQ_API_KEY")
+    model_name = _read_secret("GROQ_MODEL") or DEFAULT_GROQ_MODEL
+    # LANGSMITH_KEY is the name in this session's .env; the SDK still
+    # requires LANGSMITH_API_KEY / LANGCHAIN_API_KEY, so we copy it below.
+    langsmith_key = (
+        _read_secret("LANGSMITH_KEY")
+        or _read_secret("LANGSMITH_API_KEY")
+        or _read_secret("LANGCHAIN_API_KEY")
+    )
+    project = (
+        _read_secret("LANGSMITH_PROJECT")
+        or _read_secret("LANGCHAIN_PROJECT")
+        or LANGSMITH_PROJECT
+    )
+
+    if groq_key:
+        os.environ["GROQ_KEY"] = groq_key
+        os.environ.setdefault("GROQ_API_KEY", groq_key)
 
     tracing_on = bool(langsmith_key)
     if tracing_on:
         # Accept either historical LANGCHAIN_* names or current LANGSMITH_* names.
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGSMITH_TRACING"] = "true"
+        os.environ["LANGSMITH_KEY"] = langsmith_key
         os.environ["LANGCHAIN_API_KEY"] = langsmith_key
         os.environ["LANGSMITH_API_KEY"] = langsmith_key
         os.environ["LANGCHAIN_PROJECT"] = project
@@ -100,8 +138,9 @@ def configure_environment() -> dict[str, Any]:
         os.environ.setdefault("LANGCHAIN_TRACING_V2", "false")
 
     return {
-        "openai_ok": bool(openai_key),
-        "openai_key": openai_key or "",
+        "groq_ok": bool(groq_key),
+        "groq_key": groq_key or "",
+        "model_name": model_name,
         "langsmith_ok": tracing_on,
         "langsmith_project": project if tracing_on else None,
     }
@@ -156,10 +195,10 @@ _PRODUCT_DOCS: list[dict[str, str]] = [
         "id": "langsmith",
         "title": "LangSmith tracing on Streamlit Cloud",
         "body": (
-            "Set LANGCHAIN_TRACING_V2=true plus LANGCHAIN_API_KEY (or "
-            "LANGSMITH_API_KEY) in Streamlit secrets. Traces land in the "
-            "LangSmith project named by LANGCHAIN_PROJECT. Each graph.stream() "
-            "call becomes a run you can inspect: prompts, tool calls, tokens, latency."
+            "Set LANGCHAIN_TRACING_V2=true plus LANGSMITH_KEY (or "
+            "LANGSMITH_API_KEY / LANGCHAIN_API_KEY). Local .env is enough; Cloud "
+            "uses Streamlit secrets. Traces land in project LANGSMITH_PROJECT "
+            "(default deploy-demo-session). Each graph.stream() call becomes a run."
         ),
     },
     {
@@ -171,6 +210,17 @@ _PRODUCT_DOCS: list[dict[str, str]] = [
             "The process is a single replica: MemorySaver state survives Streamlit "
             "reruns via @st.cache_resource, but is lost on reboot. Use a durable "
             "checkpointer for real users."
+        ),
+    },
+    {
+        "id": "groq",
+        "title": "Groq as an OpenAI-compatible LLM",
+        "body": (
+            "GroqCloud exposes https://api.groq.com/openai/v1, so ChatOpenAI works "
+            "with base_url pointed at Groq and GROQ_KEY as the API key. This demo "
+            "defaults to openai/gpt-oss-20b (fast, tool-calling, developer-plan). "
+            "Override with GROQ_MODEL. Create keys at console.groq.com/keys. "
+            "Do not commit .env."
         ),
     },
     {
@@ -191,12 +241,12 @@ def search_product_docs(query: str) -> str:
     """Mock vector search over internal product documentation.
 
     Use this for questions about LangGraph, Streamlit deployment, LangSmith
-    tracing, checkpointers, thread_id memory, or tool calling. Pass a short
+    tracing, checkpointers, thread_id memory, Groq, or tool calling. Pass a short
     natural-language query.
     """
     q = (query or "").strip().lower()
     if not q:
-        return "No query provided. Ask about memory, streaming, LangSmith, or Streamlit Cloud."
+        return "No query provided. Ask about memory, streaming, Groq, LangSmith, or Streamlit Cloud."
 
     tokens = {t for t in q.replace("-", " ").split() if len(t) > 2}
 
@@ -284,20 +334,24 @@ def _run_tools(state: MessagesState) -> dict[str, list[ToolMessage]]:
 
 
 @st.cache_resource(show_spinner="Bootstrapping LangGraph agent…")
-def build_agent(openai_api_key: str):
+def build_agent(api_key: str, model_name: str):
     """Compile the graph once and reuse it across Streamlit reruns.
 
     Caching is what makes MemorySaver actually persist in this app: Streamlit
     re-executes the script on every widget interaction. Without
     ``@st.cache_resource`` a new empty checkpointer would be created each time
     and ``thread_id`` memory would appear broken.
+
+    Groq speaks the OpenAI Chat Completions protocol, so ChatOpenAI works
+    unchanged once ``base_url`` points at GroqCloud.
     """
-    if not openai_api_key:
-        raise ValueError("OPENAI_API_KEY is required to build the agent.")
+    if not api_key:
+        raise ValueError("GROQ_KEY is required to build the agent.")
 
     llm = ChatOpenAI(
-        model=MODEL_NAME,
-        api_key=openai_api_key,
+        model=model_name,
+        api_key=api_key,
+        base_url=GROQ_BASE_URL,
         temperature=0.2,
         streaming=True,
     )
@@ -423,13 +477,14 @@ def _reset_conversation() -> None:
 def _render_sidebar() -> None:
     st.sidebar.header("Deployment status")
 
-    openai_label = "connected" if ENV["openai_ok"] else "missing OPENAI_API_KEY"
+    groq_label = "connected" if ENV["groq_ok"] else "missing GROQ_KEY"
     langsmith_label = (
         f"tracing → `{ENV['langsmith_project']}`"
         if ENV["langsmith_ok"]
         else "idle (no API key)"
     )
-    st.sidebar.markdown(f"{'🟢' if ENV['openai_ok'] else '🔴'} **OpenAI** — {openai_label}")
+    st.sidebar.markdown(f"{'🟢' if ENV['groq_ok'] else '🔴'} **Groq** — {groq_label}")
+    st.sidebar.caption(f"Model: `{ENV['model_name']}`")
     st.sidebar.markdown(
         f"{'🟢' if ENV['langsmith_ok'] else '⚪'} **LangSmith** — {langsmith_label}"
     )
@@ -493,20 +548,19 @@ def main() -> None:
 
     st.title("🤖 Agent Deployment Demo")
     st.caption(
-        f"LangGraph tool-calling agent · `{MODEL_NAME}` · streamed tokens · "
+        f"LangGraph tool-calling agent · Groq `{ENV['model_name']}` · streamed tokens · "
         "checkpointer memory · optional LangSmith traces"
     )
 
-    if not ENV["openai_ok"]:
+    if not ENV["groq_ok"]:
         st.error(
-            "No OpenAI key found. For Streamlit Community Cloud, add "
-            "`OPENAI_API_KEY` under **App settings → Secrets**. For local runs, "
-            "copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` "
-            "or export the variable in your shell."
+            "No Groq key found. For Streamlit Community Cloud, add `GROQ_KEY` under "
+            "**App settings → Secrets**. For local runs, put `GROQ_KEY=...` in `.env` "
+            "(from https://console.groq.com/keys) or in `.streamlit/secrets.toml`."
         )
         st.stop()
 
-    graph = build_agent(ENV["openai_key"])
+    graph = build_agent(ENV["groq_key"], ENV["model_name"])
     _render_history()
 
     prompt = st.chat_input("Ask about time, memory, tracing, or how this app is deployed…")
